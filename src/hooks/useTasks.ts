@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { DerivedTask, Metrics, Task } from '@/types';
 import {
   computeAverageROI,
@@ -9,7 +9,6 @@ import {
   withDerived,
   sortTasks as sortDerived,
 } from '@/utils/logic';
-// Local storage removed per request; keep everything in memory
 import { generateSalesTasks } from '@/utils/seed';
 
 interface UseTasksState {
@@ -18,11 +17,16 @@ interface UseTasksState {
   error: string | null;
   derivedSorted: DerivedTask[];
   metrics: Metrics;
+
+  // 🔥 BUG 2 states
   lastDeleted: Task | null;
+  undoOpen: boolean;
+
   addTask: (task: Omit<Task, 'id'> & { id?: string }) => void;
   updateTask: (id: string, patch: Partial<Task>) => void;
   deleteTask: (id: string) => void;
   undoDelete: () => void;
+  clearUndo: () => void;
 }
 
 const INITIAL_METRICS: Metrics = {
@@ -38,84 +42,66 @@ export function useTasks(): UseTasksState {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // 🔥 BUG 2 FIX
   const [lastDeleted, setLastDeleted] = useState<Task | null>(null);
-  const fetchedRef = useRef(false);
+  const [undoOpen, setUndoOpen] = useState(false);
 
   function normalizeTasks(input: any[]): Task[] {
     const now = Date.now();
     return (Array.isArray(input) ? input : []).map((t, idx) => {
-      const created = t.createdAt ? new Date(t.createdAt) : new Date(now - (idx + 1) * 24 * 3600 * 1000);
-      const completed = t.completedAt || (t.status === 'Done' ? new Date(created.getTime() + 24 * 3600 * 1000).toISOString() : undefined);
+      const created = t.createdAt
+        ? new Date(t.createdAt)
+        : new Date(now - (idx + 1) * 24 * 3600 * 1000);
+
+      const completed =
+        t.completedAt ||
+        (t.status === 'Done'
+          ? new Date(created.getTime() + 24 * 3600 * 1000).toISOString()
+          : undefined);
+
       return {
-        id: t.id,
-        title: t.title,
-        revenue: Number(t.revenue) ?? 0,
+        id: t.id ?? crypto.randomUUID(),
+        title: t.title ?? 'Untitled Task',
+        revenue: Number.isFinite(Number(t.revenue)) ? Number(t.revenue) : 0,
         timeTaken: Number(t.timeTaken) > 0 ? Number(t.timeTaken) : 1,
-        priority: t.priority,
-        status: t.status,
-        notes: t.notes,
+        priority: t.priority ?? 'Medium',
+        status: t.status ?? 'Todo',
+        notes: t.notes ?? '',
         createdAt: created.toISOString(),
         completedAt: completed,
       } as Task;
     });
   }
 
-  // Initial load: public JSON -> fallback generated dummy
+  // ✅ BUG 1 SAFE FETCH
   useEffect(() => {
     let isMounted = true;
-    async function load() {
+
+    async function loadTasks() {
       try {
         const res = await fetch('/tasks.json');
         if (!res.ok) throw new Error(`Failed to load tasks.json (${res.status})`);
         const data = (await res.json()) as any[];
-        const normalized: Task[] = normalizeTasks(data);
-        let finalData = normalized.length > 0 ? normalized : generateSalesTasks(50);
-        // Injected bug: append a few malformed rows without validation
-        if (Math.random() < 0.5) {
-          finalData = [
-            ...finalData,
-            { id: undefined, title: '', revenue: NaN, timeTaken: 0, priority: 'High', status: 'Todo' } as any,
-            { id: finalData[0]?.id ?? 'dup-1', title: 'Duplicate ID', revenue: 9999999999, timeTaken: -5, priority: 'Low', status: 'Done' } as any,
-          ];
-        }
+        const normalized = normalizeTasks(data);
+        const finalData =
+          normalized.length > 0 ? normalized : generateSalesTasks(50);
         if (isMounted) setTasks(finalData);
       } catch (e: any) {
         if (isMounted) setError(e?.message ?? 'Failed to load tasks');
       } finally {
-        if (isMounted) {
-          setLoading(false);
-          fetchedRef.current = true;
-        }
+        if (isMounted) setLoading(false);
       }
     }
-    load();
+
+    loadTasks();
     return () => {
       isMounted = false;
     };
   }, []);
 
-  // Injected bug: opportunistic second fetch that can duplicate tasks on fast remounts
-  useEffect(() => {
-    // Delay to race with the primary loader and append duplicate tasks unpredictably
-    const timer = setTimeout(() => {
-      (async () => {
-        try {
-          const res = await fetch('/tasks.json');
-          if (!res.ok) return;
-          const data = (await res.json()) as any[];
-          const normalized = normalizeTasks(data);
-          setTasks(prev => [...prev, ...normalized]);
-        } catch {
-          // ignore
-        }
-      })();
-    }, 0);
-    return () => clearTimeout(timer);
-  }, []);
-
   const derivedSorted = useMemo<DerivedTask[]>(() => {
-    const withRoi = tasks.map(withDerived);
-    return sortDerived(withRoi);
+    return sortDerived(tasks.map(withDerived));
   }, [tasks]);
 
   const metrics = useMemo<Metrics>(() => {
@@ -126,50 +112,76 @@ export function useTasks(): UseTasksState {
     const revenuePerHour = computeRevenuePerHour(tasks);
     const averageROI = computeAverageROI(tasks);
     const performanceGrade = computePerformanceGrade(averageROI);
-    return { totalRevenue, totalTimeTaken, timeEfficiencyPct, revenuePerHour, averageROI, performanceGrade };
+    return {
+      totalRevenue,
+      totalTimeTaken,
+      timeEfficiencyPct,
+      revenuePerHour,
+      averageROI,
+      performanceGrade,
+    };
   }, [tasks]);
 
   const addTask = useCallback((task: Omit<Task, 'id'> & { id?: string }) => {
     setTasks(prev => {
       const id = task.id ?? crypto.randomUUID();
-      const timeTaken = task.timeTaken <= 0 ? 1 : task.timeTaken; // auto-correct
+      const timeTaken = task.timeTaken <= 0 ? 1 : task.timeTaken;
       const createdAt = new Date().toISOString();
-      const status = task.status;
-      const completedAt = status === 'Done' ? createdAt : undefined;
+      const completedAt = task.status === 'Done' ? createdAt : undefined;
       return [...prev, { ...task, id, timeTaken, createdAt, completedAt }];
     });
   }, []);
 
   const updateTask = useCallback((id: string, patch: Partial<Task>) => {
-    setTasks(prev => {
-      const next = prev.map(t => {
+    setTasks(prev =>
+      prev.map(t => {
         if (t.id !== id) return t;
-        const merged = { ...t, ...patch } as Task;
-        if (t.status !== 'Done' && merged.status === 'Done' && !merged.completedAt) {
-          merged.completedAt = new Date().toISOString();
+        const updated = { ...t, ...patch };
+        if (t.status !== 'Done' && updated.status === 'Done') {
+          updated.completedAt = new Date().toISOString();
         }
-        return merged;
-      });
-      // Ensure timeTaken remains > 0
-      return next.map(t => (t.id === id && (patch.timeTaken ?? t.timeTaken) <= 0 ? { ...t, timeTaken: 1 } : t));
-    });
+        if (updated.timeTaken <= 0) updated.timeTaken = 1;
+        return updated;
+      })
+    );
   }, []);
 
+  // 🔥 BUG 2 FIX — delete activates undo window
   const deleteTask = useCallback((id: string) => {
     setTasks(prev => {
       const target = prev.find(t => t.id === id) || null;
       setLastDeleted(target);
+      setUndoOpen(true);
       return prev.filter(t => t.id !== id);
     });
   }, []);
 
+  // 🔥 BUG 2 FIX — undo only while snackbar active
   const undoDelete = useCallback(() => {
-    if (!lastDeleted) return;
+    if (!lastDeleted || !undoOpen) return;
     setTasks(prev => [...prev, lastDeleted]);
     setLastDeleted(null);
-  }, [lastDeleted]);
+    setUndoOpen(false);
+  }, [lastDeleted, undoOpen]);
 
-  return { tasks, loading, error, derivedSorted, metrics, lastDeleted, addTask, updateTask, deleteTask, undoDelete };
+  // 🔥 BUG 2 FIX — snackbar close cleanup
+  const clearUndo = useCallback(() => {
+    setLastDeleted(null);
+    setUndoOpen(false);
+  }, []);
+
+  return {
+    tasks,
+    loading,
+    error,
+    derivedSorted,
+    metrics,
+    lastDeleted,
+    undoOpen,
+    addTask,
+    updateTask,
+    deleteTask,
+    undoDelete,
+    clearUndo,
+  };
 }
-
-
